@@ -11,15 +11,18 @@ import cv2
 import cv2.aruco as aruco
 import logging
 import numpy as np
+import socket
 import time # We will use this to ensure a steady processing rate
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 
 # Load the camera calibration values
-camera_calibration = np.load('Sample_Calibration.npz')
+calibration_path = Path(__file__).resolve().parent / "workdir" / "Calibration.npz"
+camera_calibration = np.load(calibration_path)
 CM=camera_calibration['CM'] #camera matrix
 dist_coef=camera_calibration['dist_coef']# distortion coefficients from the camera
-logging.info("Loaded camera calibration from Sample_Calibration.npz")
+logging.info("Loaded camera calibration from %s", calibration_path)
 
 # Define the ArUco dictionary and parameters
 marker_size = 40 # the real size of the printed marker in mm
@@ -43,22 +46,30 @@ cv2.namedWindow("Gray", cv2.WINDOW_AUTOSIZE)
 cv2.moveWindow("Gray", 640, 100)
 cv2.moveWindow("Frame", 0, 100)
 # Start capturing video
-cap = cv2.VideoCapture(0)
+camera_index = 1
+cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 if not cap.isOpened():
-    logging.error("Could not open camera 0")
+    logging.error("Could not open camera %s", camera_index)
     raise SystemExit(1)
-logging.info("Camera 0 opened")
+logging.info("Camera %s opened", camera_index)
+
+# Send one-byte commands to a Simulink UDP Receive block on this computer.
+simulink_address = ("127.0.0.1", 5005)
+marker_commands = {1: 1, 5: 2}
+command_names = {0: "STOP", 1: "LEFT", 2: "RIGHT"}
+udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Set the starting time
 start_time = time.time()
 fps = 0
 last_logged_marker_ids = None
+last_command = None
 
 while True:
     # Capture frame-by-frame
     ret, frame = cap.read()
     if not ret:
-        logging.error("Could not read a frame from camera 0; exiting")
+        logging.error("Could not read a frame from camera %s; exiting", camera_index)
         break
 
     # Convert frame to grayscale
@@ -68,6 +79,12 @@ while True:
     # Detect markers
     corners, ids, rejectedImgPoints = detector.detectMarkers(gray)
     marker_ids = tuple(sorted(int(marker_id) for marker_id in ids.flatten())) if ids is not None else ()
+    command = marker_commands.get(marker_ids[0], 0) if len(marker_ids) == 1 else 0
+    udp_socket.sendto(bytes([command]), simulink_address)
+    if command != last_command:
+        logging.info("Sent Simulink command: %s", command_names[command])
+        last_command = command
+
     if marker_ids != last_logged_marker_ids:
         if marker_ids:
             logging.info("Detected ArUco marker IDs: %s", marker_ids)
@@ -83,10 +100,29 @@ while True:
 
         # Estimate the pose of each marker from its 4 detected corners
         for i in range(len(corners)):
-            ok, rvec, tvec = cv2.solvePnP(marker_points, corners[i], CM, dist_coef, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            ok, rvec, tvec = cv2.solvePnP(
+                marker_points,
+                corners[i].reshape(4, 2),
+                CM,
+                dist_coef,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
             if ok:
+                marker_id = int(ids[i].item())
+                tx, ty, tz = tvec.flatten()
+                label = f"ID {marker_id}: t=({tx:.1f}, {ty:.1f}, {tz:.1f}) mm"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                text_size, _ = cv2.getTextSize(label, font, 0.5, 1)
+                marker_corners = corners[i].reshape(4, 2)
+                x = int(np.min(marker_corners[:, 0]))
+                y = int(np.min(marker_corners[:, 1])) - 8
+                x = max(0, min(x, frame.shape[1] - text_size[0] - 4))
+                y = max(text_size[1] + 4, y)
+                cv2.putText(frame, label, (x, y), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, label, (x, y), font, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
                 # Draw axis for each marker (axis length 10 mm)
                 frame = cv2.drawFrameAxes(frame, CM, dist_coef, rvec, tvec, 10)
+
 
     # Add the frame rate to the image
     cv2.putText(frame, f"CAMERA FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -109,6 +145,8 @@ while True:
 
 
 # When everything is done, release the capture and close windows
+udp_socket.sendto(bytes([0]), simulink_address)
+udp_socket.close()
 cap.release()
 cv2.destroyAllWindows()
 logging.info("Camera capture stopped")
