@@ -53,17 +53,17 @@ if not cap.isOpened():
     raise SystemExit(1)
 logging.info("Camera %s opened", camera_index)
 
-# Send one-byte commands to a Simulink UDP Receive block on this computer.
-simulink_address = ("127.0.0.1", 5005)
-marker_commands = {1: 1, 5: 2}
-command_names = {0: "STOP", 1: "LEFT", 2: "RIGHT"}
+# Send [enable, command] as a two-byte UDP packet to Simulink.
+simulink_address = ("138.38.226.145", 25000)
+marker_states = {1: (0, 1), 5: (0, 0)}
+stationary_state = (1, 0)
 udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Set the starting time
 start_time = time.time()
 fps = 0
 last_logged_marker_ids = None
-last_command = None
+last_sent_state = None
 
 while True:
     # Capture frame-by-frame
@@ -79,11 +79,12 @@ while True:
     # Detect markers
     corners, ids, rejectedImgPoints = detector.detectMarkers(gray)
     marker_ids = tuple(sorted(int(marker_id) for marker_id in ids.flatten())) if ids is not None else ()
-    command = marker_commands.get(marker_ids[0], 0) if len(marker_ids) == 1 else 0
-    udp_socket.sendto(bytes([command]), simulink_address)
-    if command != last_command:
-        logging.info("Sent Simulink command: %s", command_names[command])
-        last_command = command
+    enable, command = marker_states.get(marker_ids[0], stationary_state) if len(marker_ids) == 1 else stationary_state
+    state = (enable, command)
+    udp_socket.sendto(bytes(state), simulink_address)
+    if state != last_sent_state:
+        logging.info("Sent Simulink values: enable=%s, command=%s", enable, command)
+        last_sent_state = state
 
     if marker_ids != last_logged_marker_ids:
         if marker_ids:
@@ -145,7 +146,7 @@ while True:
 
 
 # When everything is done, release the capture and close windows
-udp_socket.sendto(bytes([0]), simulink_address)
+udp_socket.sendto(bytes(stationary_state), simulink_address)
 udp_socket.close()
 cap.release()
 cv2.destroyAllWindows()
